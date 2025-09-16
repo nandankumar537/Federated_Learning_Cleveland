@@ -51,4 +51,5 @@ Arguments:
 ```--server```: Address of the Flower server (default: 127.0.0.1:8080)
 
 ```--log_dir```: Directory where client logs will be saved (default: ```.```)
+
 3. Watch server logs for global metrics in ```server_logs.txt``` and check ```client*_log.txt``` for client metrics.
