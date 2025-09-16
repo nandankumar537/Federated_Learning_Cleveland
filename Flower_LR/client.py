@@ -122,7 +122,7 @@ class SklearnLRClient(fl.client.NumPyClient):
         self.X_local = X_local
         self.y_local = y_local
         self.model = LogisticRegression(
-            penalty="l2", solver="lbfgs", C=1, max_iter=1000,
+            penalty="l1", solver="liblinear", C=1, max_iter=1000,
             random_state=42
         )
         os.makedirs(log_dir, exist_ok=True)
@@ -210,4 +210,5 @@ def main():
     fl.client.start_client(server_address=args.server, client=client.to_client())
 
 if __name__ == "__main__":
+
     main()
