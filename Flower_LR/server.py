@@ -110,9 +110,9 @@ def main():
     strategy = FedAvgWithLogging(
         fraction_fit=1.0,
         fraction_evaluate=1.0,
-        min_fit_clients=2,
-        min_evaluate_clients=2,
-        min_available_clients=2,
+        min_fit_clients=3,
+        min_evaluate_clients=3,
+        min_available_clients=3,
         evaluate_fn=get_evaluate_fn(),  # no centralized dataset, but keeps API consistent
     )
 
