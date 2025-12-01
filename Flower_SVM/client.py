@@ -1,8 +1,11 @@
 import argparse
 import os
+import time
+import math
 import numpy as np
 import pandas as pd
-from typing import Tuple, Dict
+import psutil
+from typing import Tuple, Dict, List
 
 from sklearn.svm import SVC
 from sklearn.model_selection import StratifiedKFold
@@ -11,9 +14,6 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
 import flwr as fl
-
-import time
-import psutil
 
 # ----- Configuration -----
 FEATURE_COLUMNS = [
@@ -106,8 +106,25 @@ def sample_system_metrics(log_dir, samples=10, interval=0.05):
     avg_disk = sum(disk_samples) / len(disk_samples)
     return avg_cpu, avg_ram, avg_disk
 
-# ----- Flower client -----
-class SVMClient(fl.client.NumPyClient):
+# ----- DP helpers (apply to flattened pred vector) -----
+def l2_clip(v: np.ndarray, clip_norm: float) -> np.ndarray:
+    norm = np.linalg.norm(v)
+    if norm <= clip_norm or norm == 0.0:
+        return v
+    return (v / norm) * clip_norm
+
+def gaussian_noise(v: np.ndarray, sigma: float) -> np.ndarray:
+    if sigma <= 0.0:
+        return v
+    return v + np.random.normal(loc=0.0, scale=sigma, size=v.shape)
+
+def compute_sigma_from_epsilon_delta(clip_norm: float, eps: float, delta: float) -> float:
+    if eps <= 0 or delta <= 0:
+        raise ValueError("eps and delta must be > 0")
+    return (clip_norm * math.sqrt(2.0 * math.log(1.25 / delta))) / eps
+
+# ----- Flower client with prediction-aggregation DP -----
+class SVMDPClient(fl.client.NumPyClient):
     def __init__(
         self,
         client_id: int,
@@ -117,6 +134,11 @@ class SVMClient(fl.client.NumPyClient):
         y_val: np.ndarray,
         X_local: np.ndarray,
         y_local: np.ndarray,
+        X_public: np.ndarray,
+        dp_enabled: bool,
+        dp_epsilon: float,
+        dp_delta: float,
+        clip_norm: float,
         log_dir: str = ".",
     ):
         self.client_id = client_id
@@ -126,6 +148,11 @@ class SVMClient(fl.client.NumPyClient):
         self.y_val = y_val
         self.X_local = X_local
         self.y_local = y_local
+        self.X_public = X_public  # may be None
+        self.dp_enabled = dp_enabled
+        self.dp_epsilon = float(dp_epsilon)
+        self.dp_delta = float(dp_delta)
+        self.clip_norm = float(clip_norm)
         self.model = SVC(
             C=1, kernel='rbf', gamma='scale', degree=3, coef0=0, probability=True, random_state=42
         )
@@ -139,49 +166,99 @@ class SVMClient(fl.client.NumPyClient):
                     "ExecTime(s)\tAvgCPU(%)\tAvgRAM(MB)\tAvgDiskUsed(MB)\n"
                 )
 
+        # sigma for single-release Gaussian mech
+        if self.dp_enabled:
+            self.sigma = compute_sigma_from_epsilon_delta(self.clip_norm, self.dp_epsilon, self.dp_delta)
+        else:
+            self.sigma = 0.0
+
+        # placeholder for last global prediction vector
+        self.prev_pred_vector = None
+
+    def _preds_to_vector(self, preds: np.ndarray) -> np.ndarray:
+        return preds.ravel()
+
+    def _vector_to_preds(self, vec: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
+        return vec.reshape(shape)
+
     def get_parameters(self, config):
-        # Return model parameters for Flower (not used for SVM)
-        return []
+        if self.X_public is None or self.prev_pred_vector is None:
+            return []
+        return [self.prev_pred_vector.copy()]
 
     def set_parameters(self, parameters):
-        # No-op for SVM
-        pass
+        if not parameters:
+            self.prev_pred_vector = None
+            return
+        vec = np.asarray(parameters[0], dtype=float).ravel()
+        self.prev_pred_vector = vec
 
     def fit(self, parameters, config):
-        start_time = time.time()
-        server_round = int(config.get("server_round", -1))
+        t0 = time.time()
         avg_cpu, avg_ram, avg_disk = sample_system_metrics(self.log_dir, samples=10, interval=0.05)
-        self.model.fit(self.X_train, self.y_train)
-        exec_time = time.time() - start_time
-        # with open(self.log_path, "a", encoding="utf-8") as f:
-        #     f.write(
-        #         f"{server_round}\t-\t-\t-\t-\t-\t"
-        #         f"{exec_time:.4f}\t{avg_cpu:.2f}\t{avg_ram:.2f}\t{avg_disk:.2f}\n"
-        #     )
-        return [], len(self.y_train), {"server_round": server_round}
-
-    def evaluate(self, parameters, config):
-        start_time = time.time()
         server_round = int(config.get("server_round", -1))
+
+        # set incoming pred-vector if provided
+        self.set_parameters(parameters)
+
+        # train locally
+        self.model.fit(self.X_train, self.y_train)
+        exec_time = time.time() - t0
+
+        # evaluate on local validation
         p = self.model.predict(self.X_val)
         acc = accuracy_score(self.y_val, p)
         prec = precision_score(self.y_val, p, zero_division=0)
         rec = recall_score(self.y_val, p, zero_division=0)
         f1 = f1_score(self.y_val, p, zero_division=0)
-        mean_cv_acc = mean_cv_accuracy_local(self.X_local, self.y_local, folds=5)
-        avg_cpu, avg_ram, avg_disk = sample_system_metrics(self.log_dir, samples=10, interval=0.05)
-        exec_time = time.time() - start_time
+        mean_cv = mean_cv_accuracy_local(self.X_local, self.y_local, folds=5)
+
+        # if no public data provided, return no params
+        if self.X_public is None:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(f"{server_round}\t{acc:.4f}\t{prec:.4f}\t{rec:.4f}\t{f1:.4f}\t{mean_cv:.4f}\t{exec_time:.4f}\t{avg_cpu:.2f}\t{avg_ram:.2f}\t{avg_disk:.2f}\n")
+            return [], len(self.y_train), {
+                "accuracy": float(acc),
+                "precision": float(prec),
+                "recall": float(rec),
+                "f1": float(f1),
+                "mean_cv_accuracy": float(mean_cv),
+                "server_round": server_round,
+                "client_id": self.client_id,
+                "exec_time": exec_time,
+                "avg_cpu": avg_cpu,
+                "avg_ram": avg_ram,
+                "avg_disk": avg_disk,
+            }
+
+        # compute probabilities on public set
+        preds = self.model.predict_proba(self.X_public)  # (n_public, n_classes)
+        pred_vec = self._preds_to_vector(preds)
+
+        if self.prev_pred_vector is None:
+            self.prev_pred_vector = np.zeros_like(pred_vec)
+
+        delta = pred_vec - self.prev_pred_vector
+
+        if self.dp_enabled:
+            delta_clipped = l2_clip(delta, self.clip_norm)
+            delta_noisy = gaussian_noise(delta_clipped, self.sigma)
+            vec_to_send = self.prev_pred_vector + delta_noisy
+        else:
+            vec_to_send = pred_vec
+
+        # do NOT prematurely overwrite prev_pred_vector with local vec_to_send
+        # keep it until server sends authoritative aggregated vector via set_parameters next round
+
         with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(
-                f"{server_round}\t{acc:.4f}\t{prec:.4f}\t{rec:.4f}\t{f1:.4f}\t{mean_cv_acc:.4f}\t"
-                f"{exec_time:.4f}\t{avg_cpu:.2f}\t{avg_ram:.2f}\t{avg_disk:.2f}\n"
-            )
-        metrics = {
+            f.write(f"{server_round}\t{acc:.4f}\t{prec:.4f}\t{rec:.4f}\t{f1:.4f}\t{mean_cv:.4f}\t{exec_time:.4f}\t{avg_cpu:.2f}\t{avg_ram:.2f}\t{avg_disk:.2f}\n")
+
+        return [vec_to_send.astype(float)], len(self.y_train), {
             "accuracy": float(acc),
             "precision": float(prec),
             "recall": float(rec),
             "f1": float(f1),
-            "mean_cv_accuracy": float(mean_cv_acc),
+            "mean_cv_accuracy": float(mean_cv),
             "server_round": server_round,
             "client_id": self.client_id,
             "exec_time": exec_time,
@@ -189,27 +266,53 @@ class SVMClient(fl.client.NumPyClient):
             "avg_ram": avg_ram,
             "avg_disk": avg_disk,
         }
-        return 0.0, len(self.y_val), metrics
 
-def main():
+    def evaluate(self, parameters, config):
+        # update prev_pred_vector if provided
+        self.set_parameters(parameters)
+        p = self.model.predict(self.X_val)
+        acc = accuracy_score(self.y_val, p)
+        prec = precision_score(self.y_val, p, zero_division=0)
+        rec = recall_score(self.y_val, p, zero_division=0)
+        f1 = f1_score(self.y_val, p, zero_division=0)
+        mean_cv = mean_cv_accuracy_local(self.X_local, self.y_local, folds=5)
+        return 0.0, len(self.y_val), {
+            "accuracy": float(acc),
+            "precision": float(prec),
+            "recall": float(rec),
+            "f1": float(f1),
+            "mean_cv_accuracy": float(mean_cv),
+        }
+
+# -----------------------
+# CLI + entrypoint
+# -----------------------
+def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, default="cleveland.csv", help="Path to cleveland dataset CSV")
+    parser.add_argument("--public_data", type=str, default=None, help="Path to shared public data (numpy .npy)")
     parser.add_argument("--server", type=str, default="127.0.0.1:8080", help="Server address host:port")
-    parser.add_argument("--num_clients", type=int, default=2, help="Total number of clients in the federation")
-    parser.add_argument("--client_id", type=int, required=True, help="Client id in [0..num_clients-1]")
-    parser.add_argument("--log_dir", type=str, default=".", help="Directory to write client logs")
-    args = parser.parse_args()
+    parser.add_argument("--num_clients", type=int, default=3, help="Total number of clients")
+    parser.add_argument("--client_id", type=int, required=True, help="Client id (0..num_clients-1)")
+    parser.add_argument("--log_dir", type=str, default=".", help="Directory for client logs")
+    parser.add_argument("--dp_enabled", action="store_true", help="Enable client-side DP (clip+noise)")
+    parser.add_argument("--dp_epsilon", type=float, default=1.0, help="Per-release epsilon")
+    parser.add_argument("--dp_delta", type=float, default=1e-5, help="Per-release delta")
+    parser.add_argument("--clip_norm", type=float, default=1.0, help="L2 clip norm for update delta")
+    return parser.parse_args()
 
-    # Load and preprocess full dataset
+def main():
+    args = parse_args()
+
     X, y = load_and_preprocess(args.data)
-
-    # Partition this client's shard
     Xc, yc = partition_data(X, y, num_clients=args.num_clients, client_id=args.client_id, seed=42)
-
-    # Local train/val split
     (Xtr, ytr), (Xva, yva) = train_val_split(Xc, yc, val_ratio=0.2, seed=123)
 
-    client = SVMClient(
+    X_public = None
+    if args.public_data:
+        X_public = np.load(args.public_data)  # must be shape (n_public, n_features)
+
+    client = SVMDPClient(
         client_id=args.client_id,
         X_train=Xtr,
         y_train=ytr,
@@ -217,10 +320,17 @@ def main():
         y_val=yva,
         X_local=Xc,
         y_local=yc,
+        X_public=X_public,
+        dp_enabled=args.dp_enabled,
+        dp_epsilon=args.dp_epsilon,
+        dp_delta=args.dp_delta,
+        clip_norm=args.clip_norm,
         log_dir=args.log_dir,
     )
 
-    fl.client.start_client(server_address=args.server, client=client.to_client())
+    # start client
+    fl.client.start_client(server_address=args.server, client=client)
 
 if __name__ == "__main__":
+    import math
     main()
