@@ -12,6 +12,9 @@ from sklearn.linear_model import LogisticRegression
 
 import flwr as fl
 
+import time
+import psutil
+
 # ----- Configuration -----
 FEATURE_COLUMNS = [
     "age","sex","cp","trestbps","chol","fbs","restecg",
@@ -77,6 +80,33 @@ def train_val_split(
     rs.shuffle(train_idx); rs.shuffle(val_idx)
     return (Xc[train_idx], yc[train_idx]), (Xc[val_idx], yc[val_idx])
 
+# ----- System Metrics -----
+def get_client_disk_usage(log_dir="."):
+    """Return disk usage in MB for all files in log_dir."""
+    total_bytes = 0
+    for root, dirs, files in os.walk(log_dir):
+        for file in files:
+            try:
+                total_bytes += os.path.getsize(os.path.join(root, file))
+            except Exception:
+                pass
+    return total_bytes / (1024 ** 2)  # MB
+
+def sample_system_metrics(log_dir, samples=10, interval=0.05):
+    cpu_samples = []
+    ram_samples = []
+    disk_samples = []
+    process = psutil.Process(os.getpid())
+    for _ in range(samples):
+        cpu_samples.append(psutil.cpu_percent(interval=None))
+        ram_samples.append(process.memory_info().rss / (1024 ** 2))
+        disk_samples.append(get_client_disk_usage(log_dir))
+        time.sleep(interval)
+    avg_cpu = sum(cpu_samples) / len(cpu_samples)
+    avg_ram = sum(ram_samples) / len(ram_samples)
+    avg_disk = sum(disk_samples) / len(disk_samples)
+    return avg_cpu, avg_ram, avg_disk
+
 # ----- Training / Eval -----
 def evaluate_metrics_sklearn(model, X, y) -> Dict[str, float]:
     p = model.predict(X)
@@ -126,11 +156,15 @@ class SklearnLRClient(fl.client.NumPyClient):
             random_state=42
         )
         os.makedirs(log_dir, exist_ok=True)
+        self.log_dir = log_dir
         self.log_path = os.path.join(log_dir, f"client{client_id}_log.txt")
         # write header
         if not os.path.exists(self.log_path):
             with open(self.log_path, "w", encoding="utf-8") as f:
-                f.write("Round\tAccuracy\tPrecision\tRecall\tF1\tMeanCVAccuracy\n")
+                f.write(
+                    "Round\tAccuracy\tPrecision\tRecall\tF1\tMeanCVAccuracy\t"
+                    "ExecTime(s)\tAvgCPU(%)\tAvgRAM(MB)\tAvgDiskUsed(MB)\n"
+                )
 
     def get_parameters(self, config):
         # Return model coefficients and intercept as parameters (numpy arrays)
@@ -149,16 +183,29 @@ class SklearnLRClient(fl.client.NumPyClient):
         self.model.classes_ = np.array([0, 1])  # Needed for sklearn's predict
 
     def fit(self, parameters, config):
+        start_time = time.time()
         self.set_parameters(parameters)
         server_round = int(config.get("server_round", -1))
+        # Sample metrics during training
+        avg_cpu, avg_ram, avg_disk = sample_system_metrics(self.log_dir, samples=10, interval=0.05)
         self.model.fit(self.X_train, self.y_train)
+        exec_time = time.time() - start_time
+        # with open(self.log_path, "a", encoding="utf-8") as f:
+        #     f.write(
+        #         f"{server_round}\t-\t-\t-\t-\t-\t"
+        #         f"{exec_time:.4f}\t{avg_cpu:.2f}\t{avg_ram:.2f}\t{avg_disk:.2f}\n"
+        #     )
         return self.get_parameters(config={}), len(self.y_train), {"server_round": server_round}
 
     def evaluate(self, parameters, config):
+        start_time = time.time()
         self.set_parameters(parameters)
         server_round = int(config.get("server_round", -1))
         base_metrics = evaluate_metrics_sklearn(self.model, self.X_val, self.y_val)
         mean_cv_acc = mean_cv_accuracy_local(self.X_local, self.y_local, folds=5)
+        # Sample metrics during evaluation
+        avg_cpu, avg_ram, avg_disk = sample_system_metrics(self.log_dir, samples=10, interval=0.05)
+        exec_time = time.time() - start_time
         metrics = {
             "accuracy": float(base_metrics["accuracy"]),
             "precision": float(base_metrics["precision"]),
@@ -167,15 +214,18 @@ class SklearnLRClient(fl.client.NumPyClient):
             "mean_cv_accuracy": float(mean_cv_acc),
             "server_round": server_round,
             "client_id": self.client_id,
+            "exec_time": exec_time,
+            "avg_cpu": avg_cpu,
+            "avg_ram": avg_ram,
+            "avg_disk": avg_disk,
         }
-        # Append to client log
         with open(self.log_path, "a", encoding="utf-8") as f:
             f.write(
                 f"{server_round}\t"
                 f"{metrics['accuracy']:.4f}\t{metrics['precision']:.4f}\t{metrics['recall']:.4f}\t"
-                f"{metrics['f1']:.4f}\t{metrics['mean_cv_accuracy']:.4f}\n"
+                f"{metrics['f1']:.4f}\t{metrics['mean_cv_accuracy']:.4f}\t"
+                f"{metrics['exec_time']:.4f}\t{metrics['avg_cpu']:.2f}\t{metrics['avg_ram']:.2f}\t{metrics['avg_disk']:.2f}\n"
             )
-        # For Flower, return a dummy float as loss (sklearn doesn't provide loss by default)
         return 0.0, len(self.y_val), metrics
 
 def main():

@@ -12,6 +12,9 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 
 import flwr as fl
 
+import time
+import psutil
+
 # ----- Configuration -----
 FEATURE_COLUMNS = [
     "age","sex","cp","trestbps","chol","fbs","restecg",
@@ -75,59 +78,102 @@ def mean_cv_accuracy_local(X_local: np.ndarray, y_local: np.ndarray, folds: int 
         accs.append(accuracy_score(yva, yhat))
     return float(np.mean(accs)) if accs else 0.0
 
-class SklearnRFClient(fl.client.NumPyClient):
+# ----- System Metrics -----
+def get_client_disk_usage(log_dir="."):
+    total_bytes = 0
+    for root, dirs, files in os.walk(log_dir):
+        for file in files:
+            try:
+                total_bytes += os.path.getsize(os.path.join(root, file))
+            except Exception:
+                pass
+    return total_bytes / (1024 ** 2)  # MB
+
+def sample_system_metrics(log_dir, samples=10, interval=0.05):
+    cpu_samples = []
+    ram_samples = []
+    disk_samples = []
+    process = psutil.Process(os.getpid())
+    for _ in range(samples):
+        cpu_samples.append(psutil.cpu_percent(interval=None))
+        ram_samples.append(process.memory_info().rss / (1024 ** 2))
+        disk_samples.append(get_client_disk_usage(log_dir))
+        time.sleep(interval)
+    avg_cpu = sum(cpu_samples) / len(cpu_samples)
+    avg_ram = sum(ram_samples) / len(ram_samples)
+    avg_disk = sum(disk_samples) / len(disk_samples)
+    return avg_cpu, avg_ram, avg_disk
+
+# ----- Flower client -----
+class RFClient(fl.client.NumPyClient):
     def __init__(
         self,
         client_id: int,
-        Xtr: np.ndarray,
-        ytr: np.ndarray,
-        Xva: np.ndarray,
-        yva: np.ndarray,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
         X_local: np.ndarray,
         y_local: np.ndarray,
         log_dir: str = ".",
     ):
         self.client_id = client_id
-        self.Xtr = Xtr
-        self.ytr = ytr
-        self.Xva = Xva
-        self.yva = yva
+        self.X_train = X_train
+        self.y_train = y_train
+        self.X_val = X_val
+        self.y_val = y_val
         self.X_local = X_local
         self.y_local = y_local
-        self.clf = RandomForestClassifier(
-            max_depth=5,
-            n_estimators=50,
-            min_samples_split=5,
-            min_samples_leaf=1,
-            random_state=42,
+        self.model = RandomForestClassifier(
+            max_depth=5, n_estimators=50, min_samples_split=5, min_samples_leaf=1, random_state=42
         )
         os.makedirs(log_dir, exist_ok=True)
+        self.log_dir = log_dir
         self.log_path = os.path.join(log_dir, f"client{client_id}_log.txt")
         if not os.path.exists(self.log_path):
             with open(self.log_path, "w", encoding="utf-8") as f:
-                f.write("Round\tAccuracy\tPrecision\tRecall\tF1\tMeanCVAccuracy\n")
+                f.write(
+                    "Round\tAccuracy\tPrecision\tRecall\tF1\tMeanCVAccuracy\t"
+                    "ExecTime(s)\tAvgCPU(%)\tAvgRAM(MB)\tAvgDiskUsed(MB)\n"
+                )
 
     def get_parameters(self, config):
-        # Not supported for scikit-learn RandomForest, just return empty list
+        # Return model parameters for Flower (not used for RandomForest)
         return []
 
     def set_parameters(self, parameters):
-        # Not supported
+        # No-op for RandomForest
         pass
 
     def fit(self, parameters, config):
+        start_time = time.time()
         server_round = int(config.get("server_round", -1))
-        self.clf.fit(self.Xtr, self.ytr)
-        return self.get_parameters(config={}), len(self.Xtr), {"server_round": server_round}
+        avg_cpu, avg_ram, avg_disk = sample_system_metrics(self.log_dir, samples=10, interval=0.05)
+        self.model.fit(self.X_train, self.y_train)
+        exec_time = time.time() - start_time
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(
+                f"{server_round}\t-\t-\t-\t-\t-\t"
+                f"{exec_time:.4f}\t{avg_cpu:.2f}\t{avg_ram:.2f}\t{avg_disk:.2f}\n"
+            )
+        return [], len(self.y_train), {"server_round": server_round}
 
     def evaluate(self, parameters, config):
+        start_time = time.time()
         server_round = int(config.get("server_round", -1))
-        y_pred = self.clf.predict(self.Xva)
-        acc = accuracy_score(self.yva, y_pred)
-        prec = precision_score(self.yva, y_pred, zero_division=0)
-        rec = recall_score(self.yva, y_pred, zero_division=0)
-        f1 = f1_score(self.yva, y_pred, zero_division=0)
+        p = self.model.predict(self.X_val)
+        acc = accuracy_score(self.y_val, p)
+        prec = precision_score(self.y_val, p, zero_division=0)
+        rec = recall_score(self.y_val, p, zero_division=0)
+        f1 = f1_score(self.y_val, p, zero_division=0)
         mean_cv_acc = mean_cv_accuracy_local(self.X_local, self.y_local, folds=5)
+        avg_cpu, avg_ram, avg_disk = sample_system_metrics(self.log_dir, samples=10, interval=0.05)
+        exec_time = time.time() - start_time
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(
+                f"{server_round}\t{acc:.4f}\t{prec:.4f}\t{rec:.4f}\t{f1:.4f}\t{mean_cv_acc:.4f}\t"
+                f"{exec_time:.4f}\t{avg_cpu:.2f}\t{avg_ram:.2f}\t{avg_disk:.2f}\n"
+            )
         metrics = {
             "accuracy": float(acc),
             "precision": float(prec),
@@ -136,13 +182,12 @@ class SklearnRFClient(fl.client.NumPyClient):
             "mean_cv_accuracy": float(mean_cv_acc),
             "server_round": server_round,
             "client_id": self.client_id,
+            "exec_time": exec_time,
+            "avg_cpu": avg_cpu,
+            "avg_ram": avg_ram,
+            "avg_disk": avg_disk,
         }
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(
-                f"{server_round}\t{metrics['accuracy']:.4f}\t{metrics['precision']:.4f}\t"
-                f"{metrics['recall']:.4f}\t{metrics['f1']:.4f}\t{metrics['mean_cv_accuracy']:.4f}\n"
-            )
-        return 0.0, len(self.Xva), metrics
+        return 0.0, len(self.y_val), metrics
 
 def main():
     parser = argparse.ArgumentParser()
@@ -153,15 +198,23 @@ def main():
     parser.add_argument("--log_dir", type=str, default=".", help="Directory to write client logs")
     args = parser.parse_args()
 
+    # Load and preprocess full dataset
     X, y = load_and_preprocess(args.data)
+
+    # Partition this client's shard
     Xc, yc = partition_data(X, y, num_clients=args.num_clients, client_id=args.client_id, seed=42)
+
+    # Local train/val split
     (Xtr, ytr), (Xva, yva) = train_val_split(Xc, yc, val_ratio=0.2, seed=123)
 
-    client = SklearnRFClient(
+    client = RFClient(
         client_id=args.client_id,
-        Xtr=Xtr, ytr=ytr,
-        Xva=Xva, yva=yva,
-        X_local=Xc, y_local=yc,
+        X_train=Xtr,
+        y_train=ytr,
+        X_val=Xva,
+        y_val=yva,
+        X_local=Xc,
+        y_local=yc,
         log_dir=args.log_dir,
     )
 
