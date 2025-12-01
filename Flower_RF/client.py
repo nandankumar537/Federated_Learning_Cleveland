@@ -1,27 +1,30 @@
+# client_rf_dp.py
 import argparse
 import os
+import time
+import math
 import numpy as np
 import pandas as pd
+import psutil
 from typing import Tuple, Dict, List
 
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-
 import flwr as fl
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import StratifiedKFold
 
-import time
-import psutil
-
-# ----- Configuration -----
+# ----- Config -----
 FEATURE_COLUMNS = [
     "age","sex","cp","trestbps","chol","fbs","restecg",
     "thalach","exang","oldpeak","slope","ca","thal"
 ]
 TARGET_COLUMN = "target"
 
+# -----------------------
+# Data utilities
+# -----------------------
 def load_and_preprocess(csv_path: str) -> Tuple[np.ndarray, np.ndarray]:
     df = pd.read_csv(csv_path)
     if isinstance(df.columns, pd.RangeIndex) and df.shape[1] == 14:
@@ -34,24 +37,18 @@ def load_and_preprocess(csv_path: str) -> Tuple[np.ndarray, np.ndarray]:
     df[TARGET_COLUMN] = (df[TARGET_COLUMN].fillna(0).astype(int) > 0).astype(int)
     X = df[FEATURE_COLUMNS].values
     y = df[TARGET_COLUMN].values
-    imputer = SimpleImputer(strategy="median")
-    X = imputer.fit_transform(X)
-    scaler = StandardScaler()
-    X = scaler.fit_transform(X)
+    X = SimpleImputer(strategy="median").fit_transform(X)
+    X = StandardScaler().fit_transform(X)
     return X, y
 
-def partition_data(
-    X: np.ndarray, y: np.ndarray, num_clients: int, client_id: int, seed: int = 42
-) -> Tuple[np.ndarray, np.ndarray]:
+def partition_data(X: np.ndarray, y: np.ndarray, num_clients: int, client_id: int, seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
     skf = StratifiedKFold(n_splits=num_clients, shuffle=True, random_state=seed)
     for i, (_, idx_client) in enumerate(skf.split(X, y)):
         if i == client_id:
             return X[idx_client], y[idx_client]
     raise ValueError("Invalid client_id or partitioning failure")
 
-def train_val_split(
-    Xc: np.ndarray, yc: np.ndarray, val_ratio: float = 0.2, seed: int = 123
-) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
+def train_val_split(Xc: np.ndarray, yc: np.ndarray, val_ratio: float = 0.2, seed: int = 123):
     np.random.seed(seed)
     idx = np.arange(len(yc))
     np.random.shuffle(idx)
@@ -66,19 +63,15 @@ def mean_cv_accuracy_local(X_local: np.ndarray, y_local: np.ndarray, folds: int 
     for tr_idx, va_idx in skf.split(X_local, y_local):
         Xtr, Xva = X_local[tr_idx], X_local[va_idx]
         ytr, yva = y_local[tr_idx], y_local[va_idx]
-        clf = RandomForestClassifier(
-            max_depth=5,
-            n_estimators=50,
-            min_samples_split=5,
-            min_samples_leaf=1,
-            random_state=42,
-        )
+        clf = RandomForestClassifier(max_depth=5, n_estimators=50, min_samples_split=5, min_samples_leaf=1, random_state=42)
         clf.fit(Xtr, ytr)
         yhat = clf.predict(Xva)
         accs.append(accuracy_score(yva, yhat))
     return float(np.mean(accs)) if accs else 0.0
 
-# ----- System Metrics -----
+# -----------------------
+# System metrics
+# -----------------------
 def get_client_disk_usage(log_dir="."):
     total_bytes = 0
     for root, dirs, files in os.walk(log_dir):
@@ -104,8 +97,29 @@ def sample_system_metrics(log_dir, samples=10, interval=0.05):
     avg_disk = sum(disk_samples) / len(disk_samples)
     return avg_cpu, avg_ram, avg_disk
 
-# ----- Flower client -----
-class RFClient(fl.client.NumPyClient):
+# -----------------------
+# DP helpers (same as logistic version, but applied to flattened prediction vector)
+# -----------------------
+def l2_clip(v: np.ndarray, clip_norm: float) -> np.ndarray:
+    norm = np.linalg.norm(v)
+    if norm <= clip_norm or norm == 0.0:
+        return v
+    return (v / norm) * clip_norm
+
+def gaussian_noise(v: np.ndarray, sigma: float) -> np.ndarray:
+    if sigma <= 0.0:
+        return v
+    return v + np.random.normal(loc=0.0, scale=sigma, size=v.shape)
+
+def compute_sigma_from_epsilon_delta(clip_norm: float, eps: float, delta: float) -> float:
+    if eps <= 0 or delta <= 0:
+        raise ValueError("eps and delta must be > 0")
+    return (clip_norm * math.sqrt(2.0 * math.log(1.25 / delta))) / eps
+
+# -----------------------
+# Client implementation
+# -----------------------
+class RFDPClient(fl.client.NumPyClient):
     def __init__(
         self,
         client_id: int,
@@ -115,6 +129,11 @@ class RFClient(fl.client.NumPyClient):
         y_val: np.ndarray,
         X_local: np.ndarray,
         y_local: np.ndarray,
+        X_public: np.ndarray,
+        dp_enabled: bool,
+        dp_epsilon: float,
+        dp_delta: float,
+        clip_norm: float,
         log_dir: str = ".",
     ):
         self.client_id = client_id
@@ -124,62 +143,125 @@ class RFClient(fl.client.NumPyClient):
         self.y_val = y_val
         self.X_local = X_local
         self.y_local = y_local
-        self.model = RandomForestClassifier(
-            max_depth=5, n_estimators=50, min_samples_split=5, min_samples_leaf=1, random_state=42
-        )
+        self.X_public = X_public  # may be None -> no prediction-aggregation mode
+        self.dp_enabled = dp_enabled
+        self.dp_epsilon = float(dp_epsilon)
+        self.dp_delta = float(dp_delta)
+        self.clip_norm = float(clip_norm)
+        self.model = RandomForestClassifier(max_depth=5, n_estimators=50, min_samples_split=5, min_samples_leaf=1, random_state=42)
         os.makedirs(log_dir, exist_ok=True)
         self.log_dir = log_dir
         self.log_path = os.path.join(log_dir, f"client{client_id}_log.txt")
         if not os.path.exists(self.log_path):
             with open(self.log_path, "w", encoding="utf-8") as f:
-                f.write(
-                    "Round\tAccuracy\tPrecision\tRecall\tF1\tMeanCVAccuracy\t"
-                    "ExecTime(s)\tAvgCPU(%)\tAvgRAM(MB)\tAvgDiskUsed(MB)\n"
-                )
+                f.write("Round\tAccuracy\tPrecision\tRecall\tF1\tMeanCVAccuracy\tExecTime(s)\tAvgCPU(%)\tAvgRAM(MB)\tAvgDiskUsed(MB)\n")
+
+        # Prepare DP sigma if enabled
+        if self.dp_enabled:
+            # sigma computed per single release (you will need composition manually)
+            self.sigma = compute_sigma_from_epsilon_delta(self.clip_norm, self.dp_epsilon, self.dp_delta)
+        else:
+            self.sigma = 0.0
+
+        # placeholder for last global prediction vector received from server
+        self.prev_pred_vector = None
+        if self.X_public is None:
+            # no public data mode: prev_pred_vector stays None and we fallback to no-params mode
+            pass
+
+    def _preds_to_vector(self, preds: np.ndarray) -> np.ndarray:
+        # preds shape (n_public, n_classes) -> flatten
+        return preds.ravel()
+
+    def _vector_to_preds(self, vec: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
+        return vec.reshape(shape)
 
     def get_parameters(self, config):
-        # Return model parameters for Flower (not used for RandomForest)
-        return []
+        # When using public-data prediction-aggregation mode, return flattened prediction vector
+        if self.X_public is None or self.prev_pred_vector is None:
+            return []  # no parameter exchange
+        return [self.prev_pred_vector.copy()]
 
     def set_parameters(self, parameters):
-        # No-op for RandomForest
-        pass
+        # Server sends flattened prediction vector as single numpy array
+        if not parameters:
+            self.prev_pred_vector = None
+            return
+        vec = np.asarray(parameters[0], dtype=float).ravel()
+        self.prev_pred_vector = vec
 
     def fit(self, parameters, config):
-        start_time = time.time()
-        server_round = int(config.get("server_round", -1))
+        t0 = time.time()
         avg_cpu, avg_ram, avg_disk = sample_system_metrics(self.log_dir, samples=10, interval=0.05)
-        self.model.fit(self.X_train, self.y_train)
-        exec_time = time.time() - start_time
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(
-                f"{server_round}\t-\t-\t-\t-\t-\t"
-                f"{exec_time:.4f}\t{avg_cpu:.2f}\t{avg_ram:.2f}\t{avg_disk:.2f}\n"
-            )
-        return [], len(self.y_train), {"server_round": server_round}
-
-    def evaluate(self, parameters, config):
-        start_time = time.time()
         server_round = int(config.get("server_round", -1))
+
+        # Set incoming pred-vector if present
+        self.set_parameters(parameters)
+
+        # Train locally
+        self.model.fit(self.X_train, self.y_train)
+
+        exec_time = time.time() - t0
+
+        # Evaluate locally (on validation)
         p = self.model.predict(self.X_val)
         acc = accuracy_score(self.y_val, p)
         prec = precision_score(self.y_val, p, zero_division=0)
         rec = recall_score(self.y_val, p, zero_division=0)
         f1 = f1_score(self.y_val, p, zero_division=0)
-        mean_cv_acc = mean_cv_accuracy_local(self.X_local, self.y_local, folds=5)
-        avg_cpu, avg_ram, avg_disk = sample_system_metrics(self.log_dir, samples=10, interval=0.05)
-        exec_time = time.time() - start_time
+        mean_cv = mean_cv_accuracy_local(self.X_local, self.y_local, folds=5)
+
+        # If no public data provided, we cannot participate in param aggregation; return empty params
+        if self.X_public is None:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(f"{server_round}\t{acc:.4f}\t{prec:.4f}\t{rec:.4f}\t{f1:.4f}\t{mean_cv:.4f}\t{exec_time:.4f}\t{avg_cpu:.2f}\t{avg_ram:.2f}\t{avg_disk:.2f}\n")
+            return [], len(self.y_train), {
+                "accuracy": float(acc),
+                "precision": float(prec),
+                "recall": float(rec),
+                "f1": float(f1),
+                "mean_cv_accuracy": float(mean_cv),
+                "server_round": server_round,
+                "client_id": self.client_id,
+                "exec_time": exec_time,
+                "avg_cpu": avg_cpu,
+                "avg_ram": avg_ram,
+                "avg_disk": avg_disk,
+            }
+
+        # Compute predictions on public set
+        preds = self.model.predict_proba(self.X_public)  # shape (n_public, n_classes)
+        pred_vec = self._preds_to_vector(preds)
+
+        # If prev_pred_vector is not set, create zeros vector of same shape (server likely initialized zeros)
+        if self.prev_pred_vector is None:
+            self.prev_pred_vector = np.zeros_like(pred_vec)
+
+        # compute delta
+        delta = pred_vec - self.prev_pred_vector
+
+        # apply clipping and noise
+        if self.dp_enabled:
+            delta_clipped = l2_clip(delta, self.clip_norm)
+            delta_noisy = gaussian_noise(delta_clipped, self.sigma)
+            vec_to_send = self.prev_pred_vector + delta_noisy
+        else:
+            vec_to_send = pred_vec
+
+        # set prev_pred_vector to vec_to_send for local consistency (so evaluate uses same)
+        self.prev_pred_vector = vec_to_send.copy()
+
+        # Log everything
         with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(
-                f"{server_round}\t{acc:.4f}\t{prec:.4f}\t{rec:.4f}\t{f1:.4f}\t{mean_cv_acc:.4f}\t"
-                f"{exec_time:.4f}\t{avg_cpu:.2f}\t{avg_ram:.2f}\t{avg_disk:.2f}\n"
-            )
-        metrics = {
+            f.write(f"{server_round}\t{acc:.4f}\t{prec:.4f}\t{rec:.4f}\t{f1:.4f}\t{mean_cv:.4f}\t{exec_time:.4f}\t{avg_cpu:.2f}\t{avg_ram:.2f}\t{avg_disk:.2f}\n")
+
+        # Return flattened prediction vector as the single parameter array
+        return [vec_to_send.astype(float)], len(self.y_train), {
             "accuracy": float(acc),
             "precision": float(prec),
             "recall": float(rec),
             "f1": float(f1),
-            "mean_cv_accuracy": float(mean_cv_acc),
+            "mean_cv_accuracy": float(mean_cv),
             "server_round": server_round,
             "client_id": self.client_id,
             "exec_time": exec_time,
@@ -187,27 +269,54 @@ class RFClient(fl.client.NumPyClient):
             "avg_ram": avg_ram,
             "avg_disk": avg_disk,
         }
-        return 0.0, len(self.y_val), metrics
+
+    def evaluate(self, parameters, config):
+        # set incoming pred-vector if provided
+        self.set_parameters(parameters)
+        # Evaluate current RF on local validation
+        p = self.model.predict(self.X_val)
+        acc = accuracy_score(self.y_val, p)
+        prec = precision_score(self.y_val, p, zero_division=0)
+        rec = recall_score(self.y_val, p, zero_division=0)
+        f1 = f1_score(self.y_val, p, zero_division=0)
+        mean_cv = mean_cv_accuracy_local(self.X_local, self.y_local, folds=5)
+        return 0.0, len(self.y_val), {
+            "accuracy": float(acc),
+            "precision": float(prec),
+            "recall": float(rec),
+            "f1": float(f1),
+            "mean_cv_accuracy": float(mean_cv),
+        }
+
+# -----------------------
+# CLI and entrypoint
+# -----------------------
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=str, default="cleveland.csv")
+    parser.add_argument("--public_data", type=str, default=None, help="Path to shared public data (numpy .npy) used to compute predict_proba")
+    parser.add_argument("--server", type=str, default="127.0.0.1:8080")
+    parser.add_argument("--num_clients", type=int, default=3)
+    parser.add_argument("--client_id", type=int, required=True)
+    parser.add_argument("--log_dir", type=str, default=".")
+    parser.add_argument("--dp_enabled", action="store_true")
+    parser.add_argument("--dp_epsilon", type=float, default=1.0)
+    parser.add_argument("--dp_delta", type=float, default=1e-5)
+    parser.add_argument("--clip_norm", type=float, default=1.0)
+    return parser.parse_args()
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, default="cleveland.csv", help="Path to cleveland dataset CSV")
-    parser.add_argument("--server", type=str, default="127.0.0.1:8080", help="Server address host:port")
-    parser.add_argument("--num_clients", type=int, default=2, help="Total number of clients in the federation")
-    parser.add_argument("--client_id", type=int, required=True, help="Client id in [0..num_clients-1]")
-    parser.add_argument("--log_dir", type=str, default=".", help="Directory to write client logs")
-    args = parser.parse_args()
+    args = parse_args()
 
-    # Load and preprocess full dataset
     X, y = load_and_preprocess(args.data)
-
-    # Partition this client's shard
     Xc, yc = partition_data(X, y, num_clients=args.num_clients, client_id=args.client_id, seed=42)
-
-    # Local train/val split
     (Xtr, ytr), (Xva, yva) = train_val_split(Xc, yc, val_ratio=0.2, seed=123)
 
-    client = RFClient(
+    X_public = None
+    if args.public_data:
+        X_public = np.load(args.public_data)  # must be shape (n_public, n_features)
+
+    client = RFDPClient(
         client_id=args.client_id,
         X_train=Xtr,
         y_train=ytr,
@@ -215,10 +324,16 @@ def main():
         y_val=yva,
         X_local=Xc,
         y_local=yc,
+        X_public=X_public,
+        dp_enabled=args.dp_enabled,
+        dp_epsilon=args.dp_epsilon,
+        dp_delta=args.dp_delta,
+        clip_norm=args.clip_norm,
         log_dir=args.log_dir,
     )
 
-    fl.client.start_client(server_address=args.server, client=client.to_client())
+    fl.client.start_client(server_address=args.server, client=client)
 
 if __name__ == "__main__":
+    import math
     main()
